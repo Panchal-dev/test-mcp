@@ -4,12 +4,11 @@ YouTube Video MCP Server with Secure Cookie Management UI
 =========================================================
 
 Features:
-- MCP Server on /mcp (Streamable HTTP)
+- MCP Server mounted on /mcp (Streamable HTTP)
 - Web Admin Portal on /admin to upload/paste/verify YouTube cookies
-- Protected by ADMIN_PASSWORD (via session cookie)
-- Real-time on-the-spot cookie verification using yt-dlp
-- Dynamic hot-reloading of cookies without container restarts
-- Disables DNS rebinding checks to prevent Railway 421 errors
+- Password protected by ADMIN_PASSWORD (via session cookie)
+- Real-time cookie verification with yt-dlp
+- DNS rebinding checks disabled to prevent Railway 421 errors
 """
 
 from __future__ import annotations
@@ -28,11 +27,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+import uvicorn
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 
+from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.responses import HTMLResponse, JSONResponse
+from starlette.routing import Route, Mount
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
@@ -61,10 +63,7 @@ ALLOWED_YOUTUBE_HOSTS = {
     "www.youtu.be",
 }
 
-# Cookie file storage location
 COOKIES_FILE_PATH = Path(os.getenv("YOUTUBE_COOKIES_PATH", "/app/cookies.txt"))
-
-# Admin security password
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin1234")
 SESSION_COOKIE_NAME = "mcp_admin_session"
 ADMIN_SESSION_TOKEN = secrets.token_hex(32)
@@ -99,7 +98,6 @@ logger.propagate = False
 # ---------------------------------------------------------------------------
 
 def is_netscape_format(content: str) -> bool:
-    """Basic format verification for Netscape cookie file content."""
     lines = content.strip().splitlines()
     valid_lines = 0
     for raw_line in lines:
@@ -113,9 +111,8 @@ def is_netscape_format(content: str) -> bool:
 
 
 def verify_cookies_content(content: str) -> tuple[bool, str]:
-    """Test the cookies against YouTube by fetching a public video's info."""
     if not is_netscape_format(content):
-        return False, "Invalid cookie format. Content must be tab-separated Netscape format (at least 7 columns per cookie)."
+        return False, "Invalid cookie format. Netscape tab-separated cookies require at least 7 columns per entry."
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tmp:
         tmp.write(content)
@@ -133,11 +130,11 @@ def verify_cookies_content(content: str) -> tuple[bool, str]:
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(test_video_url, download=False)
-        return True, "Cookies successfully authenticated and verified with YouTube."
+        return True, "Cookies successfully authenticated and verified with YouTube!"
     except Exception as exc:
         err_msg = str(exc)
         if "Sign in to confirm you’re not a bot" in err_msg:
-            return False, "YouTube rejected these cookies (Sign in confirmation failed / Bot detected)."
+            return False, "YouTube rejected these cookies (Bot confirmation failed)."
         return False, f"Verification failed: {err_msg[:200]}"
     finally:
         try:
@@ -215,7 +212,7 @@ def cache_put(video_id: str, value: dict[str, Any]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Formatting & Helpers
+# Formatting & Extraction
 # ---------------------------------------------------------------------------
 
 def extract_video_id(url_or_id: str) -> str:
@@ -327,15 +324,10 @@ def choose_transcript(transcripts: list[Any], preferred: tuple[str, ...]) -> Any
     return ranked[0][1]
 
 
-# ---------------------------------------------------------------------------
-# Extraction Engine
-# ---------------------------------------------------------------------------
-
 def fetch_with_youtube_transcript_api(video_id: str, preferred_languages: tuple[str, ...]) -> TranscriptResult:
     api = YouTubeTranscriptApi()
     cookie_path = get_active_cookie_path()
 
-    # Pass cookie path to YouTubeTranscriptApi if available
     transcript_list = api.list(video_id, cookies=cookie_path) if cookie_path else api.list(video_id)
     available = list(transcript_list)
     if not available:
@@ -628,7 +620,7 @@ mcp = MCPServer(SERVER_NAME)
 
 @mcp.tool()
 def get_youtube_video(url: str, preferred_languages: list[str] | None = None) -> dict[str, Any]:
-    """Fetch YouTube metadata and transcript segments."""
+    """Fetch YouTube metadata and timestamped transcript segments."""
     if not isinstance(url, str) or not url.strip():
         raise ValueError("URL is required.")
     languages = normalize_preferred_languages(preferred_languages)
@@ -636,7 +628,7 @@ def get_youtube_video(url: str, preferred_languages: list[str] | None = None) ->
 
 
 # ---------------------------------------------------------------------------
-# Secure Admin Web UI (Mounted directly on Starlette/FastAPI)
+# Secure Admin HTML Template
 # ---------------------------------------------------------------------------
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -782,13 +774,12 @@ def _is_authenticated(request: Request) -> bool:
     return request.cookies.get(SESSION_COOKIE_NAME) == ADMIN_SESSION_TOKEN
 
 
-@mcp._app.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard(request: Request):
     has_active_cookie = get_active_cookie_path() is not None
     status_badge = (
         '<span class="status-badge active">&#x25CF; Active Cookies Loaded</span>'
         if has_active_cookie
-        else '<span class="status-badge inactive">&#x25CF; No Cookies Active (Blocked by YouTube)</span>'
+        else '<span class="status-badge inactive">&#x25CF; No Cookies Active (YouTube may block requests)</span>'
     )
     is_auth = _is_authenticated(request)
     auth_display = "none" if is_auth else "block"
@@ -797,12 +788,11 @@ async def admin_dashboard(request: Request):
     return HTMLResponse(page)
 
 
-@mcp._app.post("/admin/update-cookies")
 async def update_cookies(request: Request):
     try:
         data = await request.json()
     except Exception:
-        return JSONResponse({"ok": False, "error": "Invalid request payload."}, status_code=400)
+        return JSONResponse({"ok": False, "error": "Invalid JSON body."}, status_code=400)
 
     password = data.get("password", "")
     content = data.get("content", "").strip()
@@ -814,7 +804,6 @@ async def update_cookies(request: Request):
     if not content:
         return JSONResponse({"ok": False, "error": "Cookie content cannot be empty."}, status_code=400)
 
-    # Immediate live verification with YouTube
     verified, message = verify_cookies_content(content)
     if not verified:
         return JSONResponse({"ok": False, "error": message}, status_code=422)
@@ -827,35 +816,40 @@ async def update_cookies(request: Request):
         value=ADMIN_SESSION_TOKEN,
         httponly=True,
         samesite="lax",
-        max_age=86400 * 30,  # 30-day session
+        max_age=86400 * 30,
     )
     return response
 
 
 # ---------------------------------------------------------------------------
-# Server Startup
+# ASGI App Construction & Server Launch
 # ---------------------------------------------------------------------------
 
-def _build_transport_security() -> TransportSecuritySettings:
-    """Disables DNS rebinding checks to prevent Railway dynamic domain 421 errors."""
-    return TransportSecuritySettings(
-        enable_dns_rebinding_protection=False
+def create_app() -> Starlette:
+    security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
+    
+    # Generate Streamable-HTTP ASGI sub-app for /mcp endpoint
+    mcp_subapp = mcp.streamable_http_app(
+        transport_security=security,
+        json_response=True
     )
+
+    routes = [
+        Route("/admin", endpoint=admin_dashboard, methods=["GET"]),
+        Route("/admin/update-cookies", endpoint=update_cookies, methods=["POST"]),
+        Mount("/mcp", app=mcp_subapp),
+    ]
+
+    return Starlette(debug=False, routes=routes)
 
 
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "0.0.0.0")
 
-    security = _build_transport_security()
-
-    logger.info("Starting %s | transport=streamable-http | port=%d", SERVER_NAME, port)
+    logger.info("Starting %s | host=%s | port=%d", SERVER_NAME, host, port)
+    logger.info("MCP endpoint live on: /mcp")
     logger.info("Admin UI accessible on: /admin")
 
-    mcp.run(
-        transport="streamable-http",
-        host=host,
-        port=port,
-        json_response=True,
-        transport_security=security,
-    )
+    app = create_app()
+    uvicorn.run(app, host=host, port=port, log_level="info")
