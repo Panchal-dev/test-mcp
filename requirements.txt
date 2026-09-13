@@ -1,3 +1,5 @@
 mcp[cli]==2.0.0
 youtube-transcript-api==1.2.4
 yt-dlp[default]==2026.8.19
+cryptography
+python-multipart
