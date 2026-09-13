@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-YouTube Video MCP Server with Secure Cookie Management UI
-=========================================================
+YouTube Video MCP Server with Two-Step Admin Flow & Cookie Management
+====================================================================
 
-Features:
-- MCP Server mounted on /mcp (Streamable HTTP)
-- Web Admin Portal on /admin to upload/paste/verify YouTube cookies
-- Password protected by ADMIN_PASSWORD (via session cookie)
-- Real-time cookie verification with yt-dlp
-- DNS rebinding checks disabled to prevent Railway 421 errors
+Flow:
+- GET /admin -> Dedicated Login Page (enters ADMIN_PASSWORD)
+- POST /admin/login -> Sets secure session cookie, redirects to /admin/dashboard
+- GET /admin/dashboard -> Protected Upload/Paste Cookie Dashboard
+- POST /admin/update-cookies -> Verifies cookies with YouTube & saves them
+- POST /admin/logout -> Clears session cookie
+- /mcp -> MCP Streamable HTTP endpoint
 """
 
 from __future__ import annotations
@@ -33,7 +34,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Route, Mount
 
 from mcp.server.mcpserver import MCPServer
@@ -112,7 +113,7 @@ def is_netscape_format(content: str) -> bool:
 
 def verify_cookies_content(content: str) -> tuple[bool, str]:
     if not is_netscape_format(content):
-        return False, "Invalid cookie format. Netscape tab-separated cookies require at least 7 columns per entry."
+        return False, "Invalid cookie format. Provide Netscape tab-separated cookies (minimum 7 columns per cookie)."
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as tmp:
         tmp.write(content)
@@ -124,17 +125,35 @@ def verify_cookies_content(content: str) -> tuple[bool, str]:
         "no_warnings": True,
         "skip_download": True,
         "cookiefile": temp_path,
-        "socket_timeout": 15,
+        "socket_timeout": 20,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        },
     }
 
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(test_video_url, download=False)
-        return True, "Cookies successfully authenticated and verified with YouTube!"
+        return True, "Cookies successfully authenticated and verified with YouTube."
     except Exception as exc:
         err_msg = str(exc)
         if "Sign in to confirm you’re not a bot" in err_msg:
-            return False, "YouTube rejected these cookies (Bot confirmation failed)."
+            return False, "YouTube rejected these cookies: Bot confirmation failed. Re-export fresh cookies."
+        if "The page needs to be reloaded" in err_msg:
+            # Fallback check with android client directly
+            opts["extractor_args"]["youtube"]["player_client"] = ["android"]
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl_retry:
+                    ydl_retry.extract_info(test_video_url, download=False)
+                return True, "Cookies authenticated via Android client protocol."
+            except Exception as retry_exc:
+                return False, f"YouTube session verification failed: {str(retry_exc)[:200]}"
         return False, f"Verification failed: {err_msg[:200]}"
     finally:
         try:
@@ -194,11 +213,9 @@ def cache_get(video_id: str) -> dict[str, Any] | None:
         entry = _CACHE.get(video_id)
         if entry is None:
             return None
-
         if time.monotonic() - entry.created_at > CACHE_TTL_SECONDS:
             _CACHE.pop(video_id, None)
             return None
-
         _CACHE.move_to_end(video_id)
         return entry.value
 
@@ -445,6 +462,15 @@ def fetch_with_yt_dlp(url: str, video_id: str, preferred_languages: tuple[str, .
             "writesubtitles": True,
             "writeautomaticsub": True,
             "subtitlesformat": "vtt",
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "web"]
+                }
+            },
         }
 
         cookie_path = get_active_cookie_path()
@@ -502,6 +528,15 @@ def fetch_metadata(url: str) -> dict[str, Any]:
         "noplaylist": True,
         "skip_download": True,
         "socket_timeout": REQUEST_TIMEOUT_SECONDS,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web"]
+            }
+        },
     }
 
     cookie_path = get_active_cookie_path()
@@ -628,35 +663,102 @@ def get_youtube_video(url: str, preferred_languages: list[str] | None = None) ->
 
 
 # ---------------------------------------------------------------------------
-# Secure Admin HTML Template
+# HTML Templates (Login & Dashboard)
 # ---------------------------------------------------------------------------
 
-HTML_TEMPLATE = """<!DOCTYPE html>
+LOGIN_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MCP YouTube Cookie Manager</title>
+    <title>Admin Login - YouTube MCP</title>
     <style>
-        :root {
-            --bg: #0f172a; --card: #1e293b; --border: #334155;
-            --text: #f8fafc; --muted: #94a3b8; --accent: #3b82f6;
-            --success: #10b981; --error: #ef4444;
-        }
+        :root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --accent: #3b82f6; --error: #ef4444; }
+        * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        body { background: var(--bg); color: var(--text); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 1rem; }
+        .container { max-width: 400px; width: 100%; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 2.25rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+        h1 { font-size: 1.4rem; margin-bottom: 0.5rem; font-weight: 600; text-align: center; }
+        p.subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.5rem; text-align: center; }
+        .form-group { margin-bottom: 1.25rem; }
+        label { display: block; font-size: 0.85rem; margin-bottom: 0.5rem; color: var(--muted); }
+        input[type="password"] { width: 100%; background: #0b1120; border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.75rem; font-size: 0.95rem; }
+        input:focus { outline: none; border-color: var(--accent); }
+        .btn { width: 100%; padding: 0.75rem; background: var(--accent); color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 0.95rem; transition: 0.2s; }
+        .btn:hover { background: #2563eb; }
+        .alert { margin-top: 1rem; padding: 0.75rem; border-radius: 8px; font-size: 0.85rem; display: none; background: rgba(239, 68, 68, 0.15); color: var(--error); border: 1px solid var(--error); text-align: center; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Admin Authentication</h1>
+        <p class="subtitle">Enter your master password to access cookie settings</p>
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="password">Master Password</label>
+                <input type="password" id="password" placeholder="Enter ADMIN_PASSWORD" required autofocus>
+            </div>
+            <button type="submit" id="submitBtn" class="btn">Unlock Dashboard</button>
+            <div id="alertBox" class="alert"></div>
+        </form>
+    </div>
+    <script>
+        document.getElementById('loginForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const btn = document.getElementById('submitBtn');
+            const alertBox = document.getElementById('alertBox');
+            const password = document.getElementById('password').value;
+            alertBox.style.display = 'none';
+            btn.disabled = true;
+            btn.innerText = 'Verifying...';
+
+            try {
+                const res = await fetch('/admin/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password: password })
+                });
+                const data = await res.json();
+                if (res.ok && data.ok) {
+                    window.location.href = '/admin/dashboard';
+                } else {
+                    alertBox.innerText = data.error || 'Invalid credentials';
+                    alertBox.style.display = 'block';
+                }
+            } catch (err) {
+                alertBox.innerText = 'Connection error: ' + err.message;
+                alertBox.style.display = 'block';
+            } finally {
+                btn.disabled = false;
+                btn.innerText = 'Unlock Dashboard';
+            }
+        });
+    </script>
+</body>
+</html>
+"""
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cookie Manager - YouTube MCP</title>
+    <style>
+        :root { --bg: #0f172a; --card: #1e293b; --border: #334155; --text: #f8fafc; --muted: #94a3b8; --accent: #3b82f6; --success: #10b981; --error: #ef4444; }
         * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
         body { background: var(--bg); color: var(--text); padding: 2rem 1rem; display: flex; justify-content: center; }
         .container { max-width: 650px; width: 100%; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 2rem; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-        h1 { font-size: 1.5rem; margin-bottom: 0.5rem; font-weight: 600; }
-        p.subtitle { color: var(--muted); font-size: 0.9rem; margin-bottom: 1.5rem; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
+        h1 { font-size: 1.4rem; font-weight: 600; }
+        .logout-btn { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 0.4rem 0.8rem; border-radius: 6px; cursor: pointer; font-size: 0.8rem; }
+        .logout-btn:hover { color: var(--text); border-color: var(--muted); }
+        p.subtitle { color: var(--muted); font-size: 0.85rem; margin-bottom: 1.25rem; }
         .status-badge { display: inline-flex; align-items: center; padding: 0.25rem 0.75rem; border-radius: 9999px; font-size: 0.8rem; font-weight: 500; margin-bottom: 1.5rem; }
         .status-badge.active { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid var(--success); }
         .status-badge.inactive { background: rgba(239, 68, 68, 0.15); color: var(--error); border: 1px solid var(--error); }
         .form-group { margin-bottom: 1.25rem; }
         label { display: block; font-size: 0.85rem; font-weight: 500; margin-bottom: 0.5rem; color: var(--muted); }
-        input[type="password"], input[type="file"], textarea {
-            width: 100%; background: #0b1120; border: 1px solid var(--border);
-            border-radius: 8px; color: var(--text); padding: 0.75rem; font-size: 0.9rem;
-        }
+        input[type="file"], textarea { width: 100%; background: #0b1120; border: 1px solid var(--border); border-radius: 8px; color: var(--text); padding: 0.75rem; font-size: 0.875rem; }
         textarea { height: 160px; font-family: monospace; resize: vertical; }
         input:focus, textarea:focus { outline: none; border-color: var(--accent); }
         .btn { width: 100%; padding: 0.8rem; background: var(--accent); color: white; border: none; border-radius: 8px; font-weight: 600; cursor: pointer; transition: 0.2s; }
@@ -671,30 +773,24 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <h1>YouTube Cookies Setup</h1>
-        <p class="subtitle">Authenticate YouTube requests directly from this server instance.</p>
-
-        <div id="statusIndicator">
-            __STATUS_BADGE__
+        <div class="header">
+            <h1>YouTube Cookies Setup</h1>
+            <button class="logout-btn" onclick="logout()">Logout</button>
         </div>
+        <p class="subtitle">Update YouTube session cookies to bypass datacenter IP restrictions.</p>
+
+        __STATUS_BADGE__
 
         <form id="cookieForm">
-            <div id="authSection" style="__AUTH_DISPLAY__">
-                <div class="form-group">
-                    <label for="adminPass">Admin Master Password</label>
-                    <input type="password" id="adminPass" placeholder="Enter ADMIN_PASSWORD">
-                </div>
-            </div>
-
             <div class="form-group">
-                <label>Option A: Select Netscape cookies.txt</label>
+                <label>Option 1: Upload Netscape cookies.txt</label>
                 <input type="file" id="cookieFile" accept=".txt">
             </div>
 
             <div class="divider"><span>OR</span></div>
 
             <div class="form-group">
-                <label for="cookieText">Option B: Paste Netscape Format Raw Text</label>
+                <label for="cookieText">Option 2: Direct Paste Netscape Format Data</label>
                 <textarea id="cookieText" placeholder="# Netscape HTTP Cookie File&#10;.youtube.com\tTRUE\t/\tTRUE\t...\tSID\txxxxx"></textarea>
             </div>
 
@@ -710,7 +806,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const submitBtn = document.getElementById('submitBtn');
         const fileInput = document.getElementById('cookieFile');
         const textInput = document.getElementById('cookieText');
-        const passInput = document.getElementById('adminPass');
 
         fileInput.addEventListener('change', () => {
             const file = fileInput.files[0];
@@ -727,8 +822,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             alertBox.className = 'alert';
 
             const cookiesContent = textInput.value.trim();
-            const password = passInput ? passInput.value.trim() : '';
-
             if (!cookiesContent) {
                 showAlert('Please provide cookie content by file or text area.', 'error');
                 return;
@@ -741,7 +834,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 const res = await fetch('/admin/update-cookies', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password: password, content: cookiesContent })
+                    body: JSON.stringify({ content: cookiesContent })
                 });
 
                 const data = await res.json();
@@ -752,12 +845,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     showAlert(data.error || 'Failed to update cookies', 'error');
                 }
             } catch (err) {
-                showAlert('Network error occurred: ' + err.message, 'error');
+                showAlert('Network error: ' + err.message, 'error');
             } finally {
                 submitBtn.disabled = false;
                 submitBtn.innerText = 'Verify & Activate Cookies';
             }
         });
+
+        async function logout() {
+            await fetch('/admin/logout', { method: 'POST' });
+            window.location.href = '/admin';
+        }
 
         function showAlert(msg, type) {
             alertBox.innerText = msg;
@@ -770,47 +868,31 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 """
 
 
+# ---------------------------------------------------------------------------
+# Admin Endpoints & Authentication
+# ---------------------------------------------------------------------------
+
 def _is_authenticated(request: Request) -> bool:
     return request.cookies.get(SESSION_COOKIE_NAME) == ADMIN_SESSION_TOKEN
 
 
-async def admin_dashboard(request: Request):
-    has_active_cookie = get_active_cookie_path() is not None
-    status_badge = (
-        '<span class="status-badge active">&#x25CF; Active Cookies Loaded</span>'
-        if has_active_cookie
-        else '<span class="status-badge inactive">&#x25CF; No Cookies Active (YouTube may block requests)</span>'
-    )
-    is_auth = _is_authenticated(request)
-    auth_display = "none" if is_auth else "block"
-
-    page = HTML_TEMPLATE.replace("__STATUS_BADGE__", status_badge).replace("__AUTH_DISPLAY__", auth_display)
-    return HTMLResponse(page)
+async def admin_entry(request: Request):
+    if _is_authenticated(request):
+        return RedirectResponse(url="/admin/dashboard", status_code=302)
+    return HTMLResponse(LOGIN_HTML)
 
 
-async def update_cookies(request: Request):
+async def admin_login(request: Request):
     try:
         data = await request.json()
     except Exception:
-        return JSONResponse({"ok": False, "error": "Invalid JSON body."}, status_code=400)
+        return JSONResponse({"ok": False, "error": "Invalid request body"}, status_code=400)
 
     password = data.get("password", "")
-    content = data.get("content", "").strip()
+    if not password or password != ADMIN_PASSWORD:
+        return JSONResponse({"ok": False, "error": "Incorrect admin password"}, status_code=401)
 
-    if not _is_authenticated(request):
-        if not password or password != ADMIN_PASSWORD:
-            return JSONResponse({"ok": False, "error": "Incorrect admin password."}, status_code=401)
-
-    if not content:
-        return JSONResponse({"ok": False, "error": "Cookie content cannot be empty."}, status_code=400)
-
-    verified, message = verify_cookies_content(content)
-    if not verified:
-        return JSONResponse({"ok": False, "error": message}, status_code=422)
-
-    save_active_cookies(content)
-
-    response = JSONResponse({"ok": True, "message": message})
+    response = JSONResponse({"ok": True})
     response.set_cookie(
         key=SESSION_COOKIE_NAME,
         value=ADMIN_SESSION_TOKEN,
@@ -821,21 +903,63 @@ async def update_cookies(request: Request):
     return response
 
 
+async def admin_dashboard(request: Request):
+    if not _is_authenticated(request):
+        return RedirectResponse(url="/admin", status_code=302)
+
+    has_active_cookie = get_active_cookie_path() is not None
+    status_badge = (
+        '<span class="status-badge active">&#x25CF; Active Cookies Loaded</span>'
+        if has_active_cookie
+        else '<span class="status-badge inactive">&#x25CF; No Cookies Active (YouTube may block requests)</span>'
+    )
+    page = DASHBOARD_HTML.replace("__STATUS_BADGE__", status_badge)
+    return HTMLResponse(page)
+
+
+async def admin_logout(request: Request):
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return response
+
+
+async def update_cookies(request: Request):
+    if not _is_authenticated(request):
+        return JSONResponse({"ok": False, "error": "Unauthorized session. Please login again."}, status_code=401)
+
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "Invalid JSON payload."}, status_code=400)
+
+    content = data.get("content", "").strip()
+    if not content:
+        return JSONResponse({"ok": False, "error": "Cookie content cannot be empty."}, status_code=400)
+
+    verified, message = verify_cookies_content(content)
+    if not verified:
+        return JSONResponse({"ok": False, "error": message}, status_code=422)
+
+    save_active_cookies(content)
+    return JSONResponse({"ok": True, "message": message})
+
+
 # ---------------------------------------------------------------------------
 # ASGI App Construction & Server Launch
 # ---------------------------------------------------------------------------
 
 def create_app() -> Starlette:
     security = TransportSecuritySettings(enable_dns_rebinding_protection=False)
-    
-    # Generate Streamable-HTTP ASGI sub-app for /mcp endpoint
     mcp_subapp = mcp.streamable_http_app(
         transport_security=security,
         json_response=True
     )
 
     routes = [
-        Route("/admin", endpoint=admin_dashboard, methods=["GET"]),
+        Route("/admin", endpoint=admin_entry, methods=["GET"]),
+        Route("/admin/login", endpoint=admin_login, methods=["POST"]),
+        Route("/admin/dashboard", endpoint=admin_dashboard, methods=["GET"]),
+        Route("/admin/logout", endpoint=admin_logout, methods=["POST"]),
         Route("/admin/update-cookies", endpoint=update_cookies, methods=["POST"]),
         Mount("/mcp", app=mcp_subapp),
     ]
