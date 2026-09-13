@@ -38,6 +38,7 @@ Development / Inspector:
 
 from __future__ import annotations
 
+import hashlib
 import html
 import logging
 import os
@@ -92,6 +93,37 @@ ALLOWED_YOUTUBE_HOSTS = {
     "youtu.be",
     "www.youtu.be",
 }
+
+# ---------------------------------------------------------------------------
+# Cookie management configuration
+# ---------------------------------------------------------------------------
+
+ADMIN_PASSWORD = os.getenv("YOUTUBE_MCP_ADMIN_PASSWORD", "")
+SESSION_SECRET = os.getenv("YOUTUBE_MCP_SESSION_SECRET", "")
+COOKIE_ENCRYPTION_KEY = os.getenv("YOUTUBE_MCP_COOKIE_ENCRYPTION_KEY", "")
+
+# On Railway, /app is ephemeral unless a Volume is attached. The cookie store
+# is encrypted at rest, but the encryption key must be kept in Railway Variables.
+COOKIE_STORAGE_PATH = Path(
+    os.getenv("YOUTUBE_MCP_COOKIE_STORAGE_PATH", "/app/data/youtube_cookies.enc")
+)
+
+MAX_COOKIE_FILE_BYTES = int(
+    os.getenv("YOUTUBE_MCP_MAX_COOKIE_FILE_BYTES", str(2 * 1024 * 1024))
+)
+
+ACTIVE_COOKIE_SOURCE = "none"
+_ACTIVE_COOKIES = ""
+_ACTIVE_COOKIE_SHA256 = ""
+
+# Admin browser-session cookie. HttpOnly prevents JavaScript from reading it.
+ADMIN_COOKIE_NAME = "youtube_mcp_admin"
+COOKIE_CSRF_FIELD = "csrf_token"
+
+# Streamable HTTP for Railway; stdio can still be selected for local MCP use.
+TRANSPORT = os.getenv("YOUTUBE_MCP_TRANSPORT", "streamable-http").strip().lower()
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8080"))
 
 
 # ---------------------------------------------------------------------------
