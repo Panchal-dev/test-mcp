@@ -864,9 +864,9 @@ mcp = FastMCP(
     APP_NAME,
     host=HOST,
     port=PORT,
+    stateless_http=True,
     transport_security=transport_security,
 )
-
 
 # ---------------------------------------------------------------------------
 # MCP tools
@@ -1375,11 +1375,6 @@ def initialize() -> None:
 
 def main() -> None:
     initialize()
-
-    # IMPORTANT:
-    # Do not call streamable_http_app(custom_starlette_routes=...).
-    # The current MCP SDK exposes custom routes through @mcp.custom_route(),
-    # and mcp.run() serves those routes together with /mcp.
     mcp.run(transport="streamable-http")
 
 
