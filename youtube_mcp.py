@@ -58,7 +58,7 @@ from urllib.parse import parse_qs, urlparse
 import yt_dlp
 from youtube_transcript_api import YouTubeTranscriptApi
 
-from mcp.server import MCPServer
+from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 
 
