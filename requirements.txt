@@ -1,0 +1,7 @@
+# YouTube Transcript MCP - Railway production dependencies
+#
+# The supplied application uses the MCP v1 MCPServer API, so stay on the
+# maintained v1 line rather than allowing an incompatible MCP v2 upgrade.
+mcp[cli]>=1.30,<2
+youtube-transcript-api==1.2.4
+yt-dlp[default]==2026.8.19
