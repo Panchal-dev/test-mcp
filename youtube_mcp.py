@@ -19,25 +19,26 @@ Features
 - Optional encrypted persistent cookie storage
 - HttpOnly/Secure/SameSite admin session
 - Structured, real-time logging
-- Environment-backed bearer authentication for /mcp
-- Dark admin UI
 """
 
 from __future__ import annotations
 
-import asyncio
-import functools
+import base64
 import hashlib
-import hmac
 import html
+import json
 import logging
 import os
 import re
 import secrets
 import tempfile
-import threading
 import time
+import asyncio
+import hmac
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -48,7 +49,6 @@ from cryptography.fernet import Fernet, InvalidToken
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.requests import Request
-from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 
@@ -70,7 +70,6 @@ PUBLIC_DOMAIN = (
 ADMIN_PASSWORD = os.getenv("YOUTUBE_MCP_ADMIN_PASSWORD", "")
 SESSION_SECRET = os.getenv("YOUTUBE_MCP_SESSION_SECRET", "")
 COOKIE_ENCRYPTION_KEY = os.getenv("YOUTUBE_MCP_COOKIE_ENCRYPTION_KEY", "")
-MCP_API_SECRET = os.getenv("YOUTUBE_MCP_API_SECRET", "")
 
 # Persistent location. On Railway, mount /app/data as a Volume if persistence
 # across redeploys/restarts is required.
@@ -111,7 +110,6 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(APP_NAME)
-_start_time = time.time()
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +119,8 @@ _start_time = time.time()
 ACTIVE_COOKIES_TEXT: str | None = None
 ACTIVE_COOKIE_FINGERPRINT: str | None = None
 _cookie_lock = threading.RLock()
+_executor = ThreadPoolExecutor(max_workers=int(os.getenv("YOUTUBE_MCP_MAX_WORKERS", "4")))
+_start_time = time.time()
 
 
 def _fernet() -> Fernet | None:
@@ -136,11 +136,6 @@ def _fernet() -> Fernet | None:
 
 def cookie_fingerprint(cookie_text: str) -> str:
     return hashlib.sha256(cookie_text.encode("utf-8")).hexdigest()[:16]
-
-
-def get_active_cookie_state() -> tuple[str | None, str | None]:
-    with _cookie_lock:
-        return ACTIVE_COOKIES_TEXT, ACTIVE_COOKIE_FINGERPRINT
 
 
 def load_persisted_cookies() -> None:
@@ -343,14 +338,11 @@ def extract_video_id(url_or_id: str) -> str:
     if host not in YOUTUBE_HOSTS:
         raise ValueError("Please provide a valid YouTube URL or 11-character video ID")
 
-    if "list" in parsed.query or parsed.path.startswith("/playlist"):
-        raise ValueError(
-            "Playlist URLs are not supported. Please provide a single YouTube video URL."
-        )
-    if parsed.path.startswith("/channel/") or parsed.path.startswith("/c/") or parsed.path.startswith("/@"):
-        raise ValueError(
-            "Channel URLs are not supported. Please provide a single YouTube video URL."
-        )
+    path_lower = parsed.path.lower()
+    if "list" in parsed.query.lower() or path_lower.startswith("/playlist"):
+        raise ValueError("Playlist URLs are not supported. Please provide a single YouTube video URL.")
+    if path_lower.startswith("/channel/") or path_lower.startswith("/c/") or path_lower.startswith("/@"):
+        raise ValueError("Channel URLs are not supported. Please provide a single YouTube video URL.")
 
     if host in {"youtu.be", "www.youtu.be"}:
         video_id = parsed.path.strip("/").split("/")[0]
@@ -379,8 +371,7 @@ def format_timestamp(seconds: float | int) -> str:
 
 
 @contextmanager
-def cookie_tempfile_ctx() -> Any:
-    """Create a private temporary Netscape cookie file and always remove it."""
+def cookie_tempfile_ctx():
     with _cookie_lock:
         cookie_text = ACTIVE_COOKIES_TEXT
 
@@ -421,6 +412,11 @@ def _base_ydl_options(cookie_file: str | None = None) -> dict[str, Any]:
         options["cookiefile"] = cookie_file
 
     return options
+
+
+@lru_cache(maxsize=128)
+def fetch_metadata_cached(video_id: str) -> dict[str, Any]:
+    return fetch_metadata(video_id)
 
 
 def fetch_metadata(video_id: str) -> dict[str, Any]:
@@ -464,14 +460,6 @@ def fetch_metadata(video_id: str) -> dict[str, Any]:
             "availability": info.get("availability"),
         }
 
-
-@functools.lru_cache(maxsize=128)
-def _fetch_metadata_cached(video_id: str, cookie_fingerprint_value: str) -> dict[str, Any]:
-    # The fingerprint is part of the cache key so changing active cookies
-    # cannot reuse metadata extracted under the previous cookie jar.
-    return fetch_metadata(video_id)
-
-
 # ---------------------------------------------------------------------------
 # Transcript extraction
 # ---------------------------------------------------------------------------
@@ -487,49 +475,53 @@ def _snippet_values(snippet: Any) -> tuple[float, str]:
     return float(start or 0), str(text or "").strip()
 
 
-def _select_transcript(transcripts: list[Any], language: str = "en") -> Any:
+def _select_transcript(transcripts: list[Any], preferred_language: str = "en") -> Any:
     if not transcripts:
         raise ValueError("No transcripts available")
 
-    requested = (language or "en").strip().lower()
-    if requested:
-        for transcript in transcripts:
-            code = str(getattr(transcript, "language_code", "")).lower()
-            if code == requested:
-                return transcript
-        for transcript in transcripts:
-            code = str(getattr(transcript, "language_code", "")).lower()
-            if code.startswith(requested):
-                return transcript
+    preferred = preferred_language.strip().lower() or "en"
 
-    # Preferred language fallback: manually created English.
+    # Prefer manually created requested language.
     for transcript in transcripts:
         code = str(getattr(transcript, "language_code", "")).lower()
         generated = bool(getattr(transcript, "is_generated", False))
-        if code.startswith("en") and not generated:
+        if code == preferred and not generated:
             return transcript
 
-    # Then auto-generated English.
+    # Then auto-generated requested language.
     for transcript in transcripts:
         code = str(getattr(transcript, "language_code", "")).lower()
-        if code.startswith("en"):
+        if code == preferred:
             return transcript
+
+    # Preserve the original English preference as fallback.
+    if preferred != "en":
+        for transcript in transcripts:
+            code = str(getattr(transcript, "language_code", "")).lower()
+            generated = bool(getattr(transcript, "is_generated", False))
+            if code.startswith("en") and not generated:
+                return transcript
+        for transcript in transcripts:
+            code = str(getattr(transcript, "language_code", "")).lower()
+            if code.startswith("en"):
+                return transcript
 
     # Otherwise prefer manually created first.
     for transcript in transcripts:
         if not bool(getattr(transcript, "is_generated", False)):
             return transcript
 
+    # Finally: first available transcript.
     return transcripts[0]
 
 
-def fetch_transcript_api(video_id: str, language: str = "en") -> dict[str, Any]:
+def fetch_transcript_api(video_id: str, preferred_language: str = "en") -> dict[str, Any]:
     from youtube_transcript_api import YouTubeTranscriptApi
 
     api = YouTubeTranscriptApi()
     transcript_list = list(api.list(video_id))
 
-    selected = _select_transcript(transcript_list, language)
+    selected = _select_transcript(transcript_list, preferred_language)
     fetched = selected.fetch()
 
     rows: list[str] = []
@@ -562,7 +554,7 @@ def fetch_transcript_api(video_id: str, language: str = "en") -> dict[str, Any]:
     }
 
 
-def fetch_transcript_ytdlp(video_id: str, language: str = "en") -> dict[str, Any]:
+def fetch_transcript_ytdlp(video_id: str, preferred_language: str = "en") -> dict[str, Any]:
     url = f"https://www.youtube.com/watch?v={video_id}"
 
     with cookie_tempfile_ctx() as cookie_file:
@@ -571,7 +563,7 @@ def fetch_transcript_ytdlp(video_id: str, language: str = "en") -> dict[str, Any
             {
                 "writesubtitles": True,
                 "writeautomaticsub": True,
-                "subtitleslangs": [language or "en", "en.*", ".*"],
+                "subtitleslangs": ["en.*", ".*"],
                 "subtitlesformat": "vtt",
             }
         )
@@ -582,6 +574,8 @@ def fetch_transcript_ytdlp(video_id: str, language: str = "en") -> dict[str, Any
         if not info:
             raise RuntimeError("yt-dlp returned no information")
 
+        # yt-dlp exposes subtitle entries in info without downloading when
+        # extraction has succeeded. Select English first, then any language.
         subtitles = info.get("subtitles") or {}
         automatic = info.get("automatic_captions") or {}
 
@@ -593,13 +587,12 @@ def fetch_transcript_ytdlp(video_id: str, language: str = "en") -> dict[str, Any
             if not entries_map:
                 return None, None
 
-            requested = (language or "en").lower()
+            preferred = preferred_language.strip().lower() or "en"
             for lang, entries in entries_map.items():
-                if lang.lower() == requested or lang.lower().startswith(requested):
+                if lang.lower() == preferred or lang.lower().startswith(preferred + "-"):
                     return lang, entries
-
             for lang, entries in entries_map.items():
-                if lang.lower().startswith("en"):
+                if preferred == "en" and lang.lower().startswith("en"):
                     return lang, entries
 
             first_lang = next(iter(entries_map))
@@ -614,13 +607,15 @@ def fetch_transcript_ytdlp(video_id: str, language: str = "en") -> dict[str, Any
         if not selected_entries:
             raise ValueError("yt-dlp found no usable subtitles")
 
+        # yt-dlp does not always provide subtitle text directly in extract_info.
+        # Download a single VTT subtitle to a temporary directory.
         with tempfile.TemporaryDirectory(prefix="yt_subs_") as tmpdir:
             sub_options = _base_ydl_options(cookie_file)
             sub_options.update(
                 {
                     "writesubtitles": not generated,
                     "writeautomaticsub": generated,
-                    "subtitleslangs": [selected_lang or language or "en"],
+                    "subtitleslangs": [selected_lang or "en"],
                     "subtitlesformat": "vtt",
                     "outtmpl": os.path.join(tmpdir, "%(id)s.%(ext)s"),
                 }
@@ -647,7 +642,6 @@ def fetch_transcript_ytdlp(video_id: str, language: str = "en") -> dict[str, Any
             "is_translatable": False,
             "transcript": transcript,
         }
-
 
 def parse_vtt_to_timestamped_text(vtt: str) -> str:
     lines = vtt.replace("\r\n", "\n").replace("\r", "\n").split("\n")
@@ -688,8 +682,8 @@ def parse_vtt_to_timestamped_text(vtt: str) -> str:
         text = re.sub(r"\s+", " ", text)
 
         if text:
-            clean_text = html.unescape(text).strip()
-            normalized = re.sub(r"\\s+", " ", clean_text).casefold()
+            clean_text = html.unescape(text)
+            normalized = re.sub(r"\s+", " ", clean_text).strip().casefold()
             if normalized and normalized not in seen_texts:
                 seen_texts.add(normalized)
                 output.append(f"[{format_timestamp(start_seconds)}] {clean_text}")
@@ -710,12 +704,12 @@ def vtt_timestamp_to_seconds(value: str) -> float:
     return hours * 3600 + minutes * 60 + seconds
 
 
-def fetch_transcript(video_id: str, language: str = "en") -> dict[str, Any]:
+def fetch_transcript(video_id: str, preferred_language: str = "en") -> dict[str, Any]:
     errors: list[str] = []
 
     try:
         logger.info("Transcript attempt 1/2 | source=youtube-transcript-api | video=%s", video_id)
-        result = fetch_transcript_api(video_id, language)
+        result = fetch_transcript_api(video_id, preferred_language)
         logger.info(
             "Transcript success | source=%s | language=%s | generated=%s",
             result["source"],
@@ -729,7 +723,7 @@ def fetch_transcript(video_id: str, language: str = "en") -> dict[str, Any]:
 
     try:
         logger.info("Transcript attempt 2/2 | source=yt-dlp | video=%s", video_id)
-        result = fetch_transcript_ytdlp(video_id, language)
+        result = fetch_transcript_ytdlp(video_id, preferred_language)
         logger.info(
             "Transcript success | source=%s | language=%s | generated=%s",
             result["source"],
@@ -753,7 +747,9 @@ def fetch_transcript(video_id: str, language: str = "en") -> dict[str, Any]:
 def verify_youtube_cookies(cookie_text: str) -> dict[str, Any]:
     """
     Validate the Netscape jar and perform a real YouTube request with it.
+
     A successful request proves that yt-dlp can parse/use the cookie jar.
+    It does not guarantee that every YouTube account feature is authenticated.
     """
     validate_netscape_cookies(cookie_text)
 
@@ -761,12 +757,16 @@ def verify_youtube_cookies(cookie_text: str) -> dict[str, Any]:
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(cookie_text)
+
         try:
             os.chmod(path, 0o600)
         except OSError:
             pass
 
         options = _base_ydl_options(path)
+
+        # Use a normal public YouTube video to verify that yt-dlp can actually
+        # open YouTube with the supplied cookie jar.
         verification_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
 
         with yt_dlp.YoutubeDL(options) as ydl:
@@ -890,9 +890,6 @@ transport_security = TransportSecuritySettings(
     allowed_origins=allowed_origins,
 )
 
-if not MCP_API_SECRET:
-    raise RuntimeError("YOUTUBE_MCP_API_SECRET must be configured")
-
 mcp = FastMCP(
     APP_NAME,
     host=HOST,
@@ -900,7 +897,6 @@ mcp = FastMCP(
     stateless_http=True,
     transport_security=transport_security,
 )
-
 
 # ---------------------------------------------------------------------------
 # MCP tools
@@ -910,7 +906,6 @@ mcp = FastMCP(
 async def get_youtube_video(
     url: str,
     include_transcript: bool = True,
-    language: str = "en",
 ) -> dict[str, Any]:
     """
     Fetch YouTube video metadata and, when available, a timestamped transcript.
@@ -920,19 +915,18 @@ async def get_youtube_video(
     """
     video_id = extract_video_id(url)
 
-    _, cookie_fp = get_active_cookie_state()
     logger.info(
         "Tool get_youtube_video | video=%s | transcript=%s | cookies=%s",
         video_id,
         include_transcript,
-        bool(cookie_fp),
+        bool(ACTIVE_COOKIES_TEXT),
     )
 
     metadata_error: str | None = None
     transcript_error: str | None = None
 
     try:
-        metadata = await asyncio.to_thread(_fetch_metadata_cached, video_id, cookie_fp or "none")
+        metadata = fetch_metadata(video_id)
     except Exception as exc:
         metadata_error = f"{type(exc).__name__}: {exc}"
         logger.error("Metadata failed | video=%s | %s", video_id, metadata_error)
@@ -953,7 +947,7 @@ async def get_youtube_video(
 
     if include_transcript:
         try:
-            transcript = await asyncio.to_thread(fetch_transcript, video_id, language)
+            transcript = await asyncio.get_running_loop().run_in_executor(_executor, fetch_transcript, video_id)
             result["transcript"] = transcript
             result["transcript_available"] = True
         except Exception as exc:
@@ -976,16 +970,15 @@ async def get_youtube_video(
 
 
 @mcp.tool()
-async def get_youtube_transcript(
-    url: str,
-    language: str = "en",
-) -> dict[str, Any]:
+async def get_youtube_transcript(url: str, language: str = "en") -> dict[str, Any]:
     """
     Return only the timestamped transcript for a YouTube video.
     """
     video_id = extract_video_id(url)
-    logger.info("Tool get_youtube_transcript | video=%s", video_id)
-    return await asyncio.to_thread(fetch_transcript, video_id, language)
+    logger.info("Tool get_youtube_transcript | video=%s | language=%s", video_id, language)
+    return await asyncio.get_running_loop().run_in_executor(
+        _executor, lambda: fetch_transcript(video_id, language)
+    )
 
 
 @mcp.tool()
@@ -996,8 +989,7 @@ async def get_youtube_metadata(url: str) -> dict[str, Any]:
     """
     video_id = extract_video_id(url)
     logger.info("Tool get_youtube_metadata | video=%s", video_id)
-    _, cookie_fp = get_active_cookie_state()
-    return await asyncio.to_thread(_fetch_metadata_cached, video_id, cookie_fp or "none")
+    return await asyncio.get_running_loop().run_in_executor(_executor, fetch_metadata_cached, video_id)
 
 
 # ---------------------------------------------------------------------------
@@ -1006,17 +998,19 @@ async def get_youtube_metadata(url: str) -> dict[str, Any]:
 
 @mcp.custom_route("/health", methods=["GET"])
 async def health(request: Request) -> JSONResponse:
-    _, cookie_fp = get_active_cookie_state()
+    with _cookie_lock:
+        cookies_active = bool(ACTIVE_COOKIES_TEXT)
+        fingerprint = ACTIVE_COOKIE_FINGERPRINT
+
     return JSONResponse(
         {
             "status": "ok",
             "service": APP_NAME,
             "mcp_endpoint": "/mcp",
-            "cookies_active": bool(cookie_fp),
-            "cookie_fingerprint": cookie_fp,
+            "cookies_active": cookies_active,
+            "cookie_fingerprint": fingerprint,
             "yt_dlp_version": yt_dlp.version.__version__,
             "uptime_seconds": int(time.time() - _start_time),
-            "auth_required": True,
         }
     )
 
@@ -1034,9 +1028,13 @@ def admin_page(message: str = "", error: str = "") -> str:
         f'<div class="message error">{html.escape(error)}</div>' if error else ""
     )
 
-    _, cookie_fp = get_active_cookie_state()
-    cookie_status = "ACTIVE" if cookie_fp else "NOT ACTIVE"
-    fingerprint = cookie_fp or "—"
+    cookie_status = (
+        "ACTIVE"
+        if ACTIVE_COOKIES_TEXT
+        else "NOT ACTIVE"
+    )
+
+    fingerprint = ACTIVE_COOKIE_FINGERPRINT or "—"
 
     return f"""<!doctype html>
 <html>
@@ -1051,12 +1049,12 @@ body {{
     margin: 40px auto;
     padding: 0 20px;
     line-height: 1.5;
-    background: #0b1020;
-    color: #e8ecf4;
+    background: #0b0f14;
+    color: #e7edf3;
 }}
 .card {{
-    background: #121a2b;
-    border: 1px solid #26324a;
+    background: #111820;
+    border: 1px solid #28323d;
     border-radius: 12px;
     padding: 24px;
     margin-bottom: 20px;
@@ -1068,7 +1066,7 @@ textarea {{
     font-family: ui-monospace,SFMono-Regular,Menlo,monospace;
     font-size: 13px;
     padding: 12px;
-    border: 1px solid #34425f;
+    border: 1px solid #394654;
     border-radius: 8px;
 }}
 input[type=password],input[type=file] {{
@@ -1084,17 +1082,17 @@ button {{
     cursor: pointer;
     margin-right: 8px;
 }}
-.primary {{ background:#5b8cff; color:#fff; }}
-.danger {{ background:#d94a5f; color:#fff; }}
+.primary {{ background:#e7edf3; color:#0b0f14; }}
+.danger {{ background:#b42318; color:#fff; }}
 .message {{
     padding: 12px;
     border-radius: 8px;
     margin: 12px 0;
 }}
-.success {{ background:#153b2a; color:#8fe3b1; }}
-.error {{ background:#421d27; color:#ff9eac; }}
-.small {{ color:#aab5c8; font-size:14px; }}
-code {{ background:#1b263b; padding:2px 5px; border-radius:4px; }}
+.success {{ background:#10251b; color:#7ee2a8; }}
+.error {{ background:#2b1518; color:#ff9b9b; }}
+.small {{ color:#9aa8b6; font-size:14px; }}
+code {{ background:#1b242e; padding:2px 5px; border-radius:4px; }}
 </style>
 </head>
 <body>
@@ -1167,9 +1165,9 @@ async def admin_cookies_get(request: Request) -> Response:
             """<!doctype html>
 <html><head><meta charset="utf-8"><title>Admin Login</title>
 <style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:500px;margin:60px auto;padding:20px;background:#0b1020;color:#e8ecf4}
-input{width:100%;box-sizing:border-box;padding:12px;margin:8px 0;background:#121a2b;color:#e8ecf4;border:1px solid #34425f;border-radius:8px}
-button{width:100%;box-sizing:border-box;padding:12px;margin:8px 0;background:#5b8cff;color:white;border:0;border-radius:8px;cursor:pointer}
+body{font-family:system-ui;max-width:500px;margin:60px auto;padding:20px;background:#0b0f14;color:#e7edf3}
+input,button{width:100%;box-sizing:border-box;padding:12px;margin:8px 0}
+button{background:#e7edf3;color:#0b0f14;border:0;border-radius:8px;cursor:pointer}
 </style></head>
 <body>
 <h1>Admin Login</h1>
@@ -1289,12 +1287,11 @@ async def process_new_cookies(
                 )
             raise
 
-        _, cookie_fp = get_active_cookie_state()
         return HTMLResponse(
             admin_page(
                 message=(
                     "Cookies verified successfully and activated. "
-                    f"Fingerprint: {cookie_fp}"
+                    f"Fingerprint: {ACTIVE_COOKIE_FINGERPRINT}"
                 )
             )
         )
@@ -1363,39 +1360,11 @@ async def admin_cookies_clear(request: Request) -> Response:
         )
 
 
-class MCPSecretMiddleware(BaseHTTPMiddleware):
-    """Require a server-side bearer secret for every MCP HTTP request."""
-
-    async def dispatch(self, request: Request, call_next):
-        if request.url.path.rstrip("/") == "/mcp":
-            authorization = request.headers.get("authorization", "")
-            scheme, _, token = authorization.partition(" ")
-            if (
-                scheme.lower() != "bearer"
-                or not token
-                or not MCP_API_SECRET
-                or not secrets.compare_digest(token.strip(), MCP_API_SECRET)
-            ):
-                return JSONResponse(
-                    {"error": "Unauthorized", "message": "Valid bearer token required."},
-                    status_code=401,
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-        return await call_next(request)
-
-
 # ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
 def initialize() -> None:
-    if not MCP_API_SECRET:
-        raise RuntimeError("YOUTUBE_MCP_API_SECRET is not configured")
-    if len(MCP_API_SECRET) < 32:
-        raise RuntimeError("YOUTUBE_MCP_API_SECRET must be at least 32 characters")
-    if SESSION_SECRET and len(SESSION_SECRET) < 32:
-        raise RuntimeError("YOUTUBE_MCP_SESSION_SECRET must be at least 32 characters")
-
     logger.info(
         "Starting %s | transport=streamable-http | host=%s | port=%s",
         APP_NAME,
@@ -1434,7 +1403,7 @@ def initialize() -> None:
 
     load_persisted_cookies()
 
-    logger.info("MCP endpoint | /mcp | bearer authentication enabled")
+    logger.info("MCP endpoint | /mcp")
     logger.info("Admin cookie manager | /admin/cookies")
     logger.info("Health endpoint | /health")
     logger.info(
@@ -1445,9 +1414,7 @@ def initialize() -> None:
 
 def main() -> None:
     initialize()
-    app = mcp.streamable_http_app()
-    app.add_middleware(MCPSecretMiddleware)
-    uvicorn.run(app, host=HOST, port=PORT, log_level=LOG_LEVEL.lower())
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
