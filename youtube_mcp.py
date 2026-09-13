@@ -1380,11 +1380,7 @@ def main() -> None:
     # Do not call streamable_http_app(custom_starlette_routes=...).
     # The current MCP SDK exposes custom routes through @mcp.custom_route(),
     # and mcp.run() serves those routes together with /mcp.
-    mcp.run(
-        transport="streamable-http",
-        host=HOST,
-        port=PORT,
-    )
+    mcp.run(transport="streamable-http")
 
 
 if __name__ == "__main__":
