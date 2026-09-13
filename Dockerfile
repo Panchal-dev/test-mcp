@@ -14,6 +14,6 @@ RUN python -m pip install --upgrade pip \
 
 COPY youtube_mcp.py .
 
-EXPOSE 8000
+EXPOSE 8080
 
 CMD ["python", "youtube_mcp.py"]
